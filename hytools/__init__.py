@@ -20,3 +20,9 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
 Initialize hytools
 """
 from .base import HyTools
+
+try:
+    from importlib.metadata import version
+    __version__ = version("hy-tools")
+except Exception:
+    __version__ = "0.0.1.dev0+unknown"
