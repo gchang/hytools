@@ -37,6 +37,8 @@ and install with setuptools
 python setup.py install
 ```
 
+To check an install, build and install the wheel (`python -m build && python -m pip install dist/*.whl`), download `f130410t01p00r09_refl.tar.gz` and `f130410t01p00r09.tar.gz` from https://popo.jpl.nasa.gov/avcl/y13_data/ into an empty folder, and from there run `python <repo>/tests/untar_ball.py f130410t01p00r09 ./ ./` and then `python <repo>/tests/exec_ht.py ./f130410t01p00r09rdn_refl_img_corr ./f130410t01p00r09rdn_e_obs_ort ./`, which writes `ci_test_plot.png`.
+
 ## Basic usage
 ```python
 
