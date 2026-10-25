@@ -604,6 +604,12 @@ class HyTools:
 
         wave1 = self.get_wave(wave1)
         wave2 = self.get_wave(wave2)
+        # Integer bands (e.g. uint16 reflectance x 10000) wrap around in
+        # the difference and overflow in the sum, so compute in float
+        if np.issubdtype(wave1.dtype, np.integer):
+            wave1 = wave1.astype(float)
+        if np.issubdtype(wave2.dtype, np.integer):
+            wave2 = wave2.astype(float)
         ndi = (wave1-wave2)/(wave1+wave2)
 
         if mask:
