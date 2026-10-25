@@ -1,0 +1,204 @@
+# -*- coding: utf-8 -*-
+"""
+HyTools:  Hyperspectral image processing library
+Copyright (C) 2021 University of Wisconsin
+
+Authors: Adam Chlus, Zhiwei Ye, Philip Townsend.
+
+This program is free software: you can redistribute it and/or modify
+it under the terms of the GNU General Public License as published by
+the Free Software Foundation, version 3 of the License.
+
+This program is distributed in the hope that it will be useful,
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+GNU General Public License for more details.
+
+You should have received a copy of the GNU General Public License
+along with this program.  If not, see <https://www.gnu.org/licenses/>.
+
+This module contains functions to apply a topographic correction (SCS+C)
+described in the following papers:
+
+Scott A. Soenen, Derek R. Peddle,  & Craig A. Coburn (2005).
+SCS+C: A Modified Sun-Canopy-Sensor Topographic Correction in Forested Terrain.
+IEEE Transactions on Geoscience and Remote Sensing, 43(9), 2148-2159.
+https://doi.org/10.1109/TGRS.2005.852480
+
+Topographic correction consists of the following steps:
+
+    1. calculate incidence angle if it is not provided
+    2. estimate C-Correction value
+    3. apply C-Correction value to the image data
+
+TODO: Rationale/ examples for using different fitting algorithms
+
+"""
+import numpy as np
+from .c import calc_c, get_band_samples, get_cosine_i_samples
+import ray
+from ..misc import update_topo
+from ..misc import progbar
+
+def calc_scsc_c1(solar_zn,slope):
+    """ Calculate c1
+        All input geometry units must be in radians.
+
+    Args:
+        solar_zn (numpy.ndarray): Solar zenith angle.
+        slope (numpy.ndarray): Ground slope.
+
+    Returns:
+        numpy.ndarray: C1.
+
+    """
+
+    # Eq 11. Soenen et al. 2005
+    scsc_c1 = np.cos(solar_zn) * np.cos(slope)
+    return scsc_c1
+
+def calc_scsc_coeffs(hy_obj,topo_dict):
+    '''
+
+    Args:
+        hy_obj (TYPE): DESCRIPTION.
+
+    Returns:
+        None.
+
+    '''
+
+    topo_dict['coeffs'] = {}
+    cosine_i = hy_obj.cosine_i()
+
+    for band_num,band in enumerate(hy_obj.bad_bands):
+        if ~band:
+            band = hy_obj.get_band(band_num,mask='calc_topo')
+            topo_dict['coeffs'][band_num] = calc_c(band,cosine_i[hy_obj.mask['calc_topo']],
+                                                   fit_type=topo_dict['c_fit_type'])
+    hy_obj.topo = topo_dict
+
+def calc_scsc_coeffs_group(actors,topo_dict,group_tag):
+
+    cosine_i_samples = ray.get([a.do.remote(get_cosine_i_samples) for a in actors])
+    cosine_i_samples = np.concatenate(cosine_i_samples)
+
+    print(f'Topo Subgroup {group_tag}')
+
+    bad_bands = ray.get(actors[0].do.remote(lambda x: x.bad_bands))
+    coeffs = {}
+
+    for band_num,band in enumerate(bad_bands):
+        if ~band:
+            coeffs[band_num] = {}
+            band_samples = ray.get([a.do.remote(get_band_samples,
+                                     {'band_num':band_num}) for a in actors])
+            band_samples = np.concatenate(band_samples)
+
+            coeffs[band_num] = calc_c(band_samples,cosine_i_samples,fit_type=topo_dict['c_fit_type'])
+            progbar(np.sum(~bad_bands[:band_num+1]),np.sum(~bad_bands))
+
+    print('\n')
+
+    #Update TOPO coeffs
+    _ = ray.get([a.do.remote(update_topo,{'key':'coeffs',
+                                          'value': coeffs}) for a in actors])
+    _ = ray.get([a.do.remote(update_topo,{'key':'subgroup',
+                                          'value': group_tag}) for a in actors])
+
+def apply_scsc_band(hy_obj,band,index):
+    '''
+
+    Args:
+        hy_obj (TYPE): DESCRIPTION.
+        band (TYPE): DESCRIPTION.
+        index (TYPE): DESCRIPTION.
+
+    Returns:
+        band (TYPE): DESCRIPTION.
+
+    '''
+
+    c1 = np.cos(hy_obj.get_anc('slope')) * np.cos(hy_obj.get_anc('solar_zn'))
+    cosine_i = hy_obj.cosine_i()
+
+    C = hy_obj.topo['coeffs'][index]
+    correction_factor = (c1 + C)/(cosine_i + C)
+    band[hy_obj.mask['calc_topo']] = band[hy_obj.mask['calc_topo']] * correction_factor[hy_obj.mask['calc_topo']]
+    band[~hy_obj.mask['no_data']] = hy_obj.no_data
+
+    return band
+
+def apply_scsc(hy_obj,data,dimension,index):
+    ''' Apply SCSS correction to a slice of the data
+
+    Args:
+        hy_obj (TYPE): DESCRIPTION.
+        band (TYPE): DESCRIPTION.
+        index (TYPE): DESCRIPTION.
+
+    Returns:
+        band (TYPE): DESCRIPTION.
+
+    '''
+
+    if 'c1' not in hy_obj.ancillary.keys():
+        c1 = np.cos(hy_obj.get_anc('slope')) * np.cos(hy_obj.get_anc('solar_zn'))
+        hy_obj.ancillary['c1'] = c1
+    if 'cosine_i' not in hy_obj.ancillary.keys():
+        cosine_i = hy_obj.cosine_i()
+        hy_obj.ancillary['cosine_i'] = cosine_i
+
+    C_bands = list([int(x) for x in hy_obj.topo['coeffs'].keys()])
+    C = np.array(list(hy_obj.topo['coeffs'].values()))
+
+    #Convert to float
+    data = data.astype(np.float32)
+    hy_obj.topo['coeffs'] =  {int(k): hy_obj.topo['coeffs'][k] for k in hy_obj.topo['coeffs']}
+
+    if (dimension != 'band') & (dimension != 'chunk'):
+        if dimension == 'line':
+            #index= 3000
+            #data = hy_obj.get_line(3000)
+            mask = hy_obj.mask['apply_topo'][index,:]
+            cosine_i = hy_obj.ancillary['cosine_i'][[index],:].T
+            c1 = hy_obj.ancillary['c1'][[index],:].T
+
+        elif dimension == 'column':
+            #index= 300
+            #data = hy_obj.get_column(index)
+            mask = hy_obj.mask['apply_topo'][:,index]
+            cosine_i = hy_obj.ancillary['cosine_i'][:,[index]]
+            c1 = hy_obj.ancillary['c1'][:,[index]]
+
+        elif dimension == 'pixels':
+            #index = [[2000,2001],[200,501]]
+            y,x = index
+            #data = hy_obj.get_pixels(y,x)
+            mask = hy_obj.mask['apply_topo'][y,x]
+            cosine_i = hy_obj.ancillary['cosine_i'][[y],[x]].T
+            c1 = hy_obj.ancillary['c1'][[y],[x]].T
+
+        correction_factor = np.ones(data.shape)
+        correction_factor[:,C_bands] = (c1 + C)/(cosine_i + C)
+        data[mask,:] = data[mask,:]*correction_factor[mask,:]
+
+    elif dimension  == 'chunk':
+        #index = 200,501,3000,3501
+        x1,x2,y1,y2 = index
+        #data = hy_obj.get_chunk(x1,x2,y1,y2)
+        mask = hy_obj.mask['apply_topo'][y1:y2,x1:x2]
+        cosine_i = hy_obj.ancillary['cosine_i'][y1:y2,x1:x2][:,:,np.newaxis]
+        c1 = hy_obj.ancillary['c1'][y1:y2,x1:x2][:,:,np.newaxis]
+
+        correction_factor = np.ones(data.shape)
+        correction_factor[:,:,C_bands] = (c1 + C)/(cosine_i + C)
+        data[mask,:] = data[mask,:]*correction_factor[mask,:]
+
+    elif (dimension  == 'band') and (index in hy_obj.topo['coeffs']):
+        #index= 8
+        #data = hy_obj.get_band(index)
+        C = hy_obj.topo['coeffs'][index]
+        correction_factor = (hy_obj.ancillary['c1'] + C)/(hy_obj.ancillary['cosine_i'] + C)
+        data[hy_obj.mask['apply_topo']] = data[hy_obj.mask['apply_topo']] * correction_factor[hy_obj.mask['apply_topo']]
+    return data
